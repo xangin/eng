@@ -5,10 +5,10 @@
     {
       "chipFamily": "ESP32-S3",
       "ota": {
-        "md5": "003b2a804858878ca3314e66f5003674",
-        "path": "https://github.com/xangin/Daikin-ESPhome/raw/refs/heads/main/s3.ota.bin",
+        "md5": "7e2efd3b8a440d0815f9f608881e7819",
+        "path": "https://github.com/xangin/eng/raw/refs/heads/main/ota/panasonic/s3-climate-p.ota.bin",
         "release_url": "",
-        "summary": "test update1"
+        "summary": "test update123"
       }
     }   
   ]
