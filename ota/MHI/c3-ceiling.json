@@ -1,5 +1,5 @@
 {
-  "name": "ESPhome MHI AC Ceiling",
+  "name": "SimonIoT.MHI-AC-Ceiling",
   "version": "2025.9.26",
   "builds": [
     {
@@ -8,7 +8,7 @@
         "md5": "e9d5835cb7235af44792ec341692d080",
         "path": "https://github.com/xangin/mhi-ac-ctrl-esp32-c3/raw/refs/heads/master/mhi-ac-ceiling.ota.bin",
         "release_url": "",
-        "summary": "First Upload"
+        "summary": "首次上傳"
       }
     }   
   ]
