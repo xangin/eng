@@ -46,200 +46,201 @@ TIME() {
 
 
 #--------------PVE更換軟體源----------------
-# apt國內源
-aptsources() {
-	sver=`cat /etc/debian_version |awk -F"." '{print $1}'`
-	case "$sver" in
- 	12 )
-  		sver="bookworm"
- 	;;
-	11 )
-		sver="bullseye"
-	;;
-	10 )
-		sver="buster"
-	;;
-	9 )
-		sver="stretch"
-	;;
-	8 )
-		sver="jessie"
-	;;
-	7 )
-		sver="wheezy"
-	;;
-	6 )
-		sver="squeeze"
-	;;
-	* )
-		sver=""
-	;;
+# 台灣鏡像站（2026-10 測試可用）。
+# Proxmox 套件與 CT 範本目前只有台灣數位串流（TWDS）提供台灣鏡像。
+PVE_TW_PROXMOX_MIRROR="https://mirror.twds.com.tw/proxmox"
+PVE_OFFICIAL_PROXMOX="http://download.proxmox.com"
+DEBIAN_OFFICIAL_SECURITY="http://security.debian.org/debian-security"
+PVE_ARCHIVE_KEYRING="/usr/share/keyrings/proxmox-archive-keyring.gpg"
+DEBIAN_ARCHIVE_KEYRING="/usr/share/keyrings/debian-archive-keyring.gpg"
+
+# 依 Debian 主版本號取得代號
+debian_codename() {
+	case "$(cut -d. -f1 /etc/debian_version)" in
+	13 ) echo "trixie" ;;
+	12 ) echo "bookworm" ;;
+	11 ) echo "bullseye" ;;
+	10 ) echo "buster" ;;
+	9 ) echo "stretch" ;;
+	8 ) echo "jessie" ;;
+	7 ) echo "wheezy" ;;
+	6 ) echo "squeeze" ;;
+	* ) echo "" ;;
 	esac
+}
+
+# Debian 13（PVE 9）起改用 deb822 格式的 .sources 檔
+is_deb822_release() {
+	case "$1" in
+	bookworm|bullseye|buster|stretch|jessie|wheezy|squeeze) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+debian_components() {
+	case "$1" in
+	trixie|bookworm) echo "main contrib non-free non-free-firmware" ;;
+	*) echo "main contrib non-free" ;;
+	esac
+}
+
+debian_security_suite() {
+	case "$1" in
+	buster|stretch|jessie|wheezy|squeeze) echo "$1/updates" ;;
+	*) echo "$1-security" ;;
+	esac
+}
+
+# 輸出 Debian 來源內容：$1=代號 $2=主鏡像 $3=安全性更新鏡像
+debian_sources_content() {
+	local sver="$1" mirror="$2" security="$3" comp suite secsuite
+	comp=$(debian_components "$sver")
+	secsuite=$(debian_security_suite "$sver")
+	if is_deb822_release "$sver"; then
+		printf 'Types: deb\nURIs: %s/\nSuites: %s %s-updates %s-backports\nComponents: %s\nSigned-By: %s\n\n' \
+			"$mirror" "$sver" "$sver" "$sver" "$comp" "$DEBIAN_ARCHIVE_KEYRING"
+		printf 'Types: deb\nURIs: %s/\nSuites: %s\nComponents: %s\nSigned-By: %s\n' \
+			"$security" "$secsuite" "$comp" "$DEBIAN_ARCHIVE_KEYRING"
+	else
+		for suite in "$sver" "$sver-updates" "$sver-backports"; do
+			printf 'deb %s/ %s %s\ndeb-src %s/ %s %s\n' "$mirror" "$suite" "$comp" "$mirror" "$suite" "$comp"
+		done
+		printf 'deb %s/ %s %s\ndeb-src %s/ %s %s\n' "$security" "$secsuite" "$comp" "$security" "$secsuite" "$comp"
+	fi
+}
+
+# 輸出 Proxmox 免訂閱源內容：$1=代號 $2=Proxmox 鏡像根目錄
+pve_sources_content() {
+	if is_deb822_release "$1"; then
+		printf 'Types: deb\nURIs: %s/debian/pve\nSuites: %s\nComponents: pve-no-subscription\nSigned-By: %s\n' \
+			"$2" "$1" "$PVE_ARCHIVE_KEYRING"
+	else
+		printf 'deb %s/debian/pve %s pve-no-subscription\n' "$2" "$1"
+	fi
+}
+
+# apt台灣源
+aptsources() {
+	local mirror security
+	sver=$(debian_codename)
 	if [ ! $sver ];then
 		TIME r "您的版本不支援！"
 		exit 1
 	fi
-	cp -rf /etc/apt/sources.list /etc/apt/backup/sources.list.bak
-	echo " 請選擇您需要的apt國內源"
-	echo " 1. 清華大學鏡像站"
-	echo " 2. 中科大鏡像站"
-	echo " 3. 上海交大鏡像站"
-	echo " 4. 阿里雲鏡像站"
-	echo " 5. 騰訊雲鏡像站"
-	echo " 6. 網易鏡像站"
-	echo " 7. 華為鏡像站"
+	echo " 請選擇您需要的apt台灣鏡像站"
+	echo " 1. 台灣數位串流 TWDS（含安全性更新）"
+	echo " 2. 國家高速網路中心 NCHC"
+	echo " 3. 陽明交大資工系"
+	echo " 4. Debian 官方台灣鏡像站"
+	echo " 註：2～4 未提供安全性更新，安全性更新改用 Debian 官方源。"
 	input="請輸入選擇[默認1]"
 	while :; do
 	read -t 30 -p " ${input}： " aptsource || echo
 	aptsource=${aptsource:-1}
 	case $aptsource in
 	1)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver} main contrib non-free
-		deb-src https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver} main contrib non-free
-		deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-updates main contrib non-free
-		deb-src https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-updates main contrib non-free
-		deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-backports main contrib non-free
-		deb-src https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-backports main contrib non-free
-		deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${sver}-security main contrib non-free
-		deb-src https://mirrors.tuna.tsinghua.edu.cn/debian-security ${sver}-security main contrib non-free
-	EOF
-	break
+		mirror="https://mirror.twds.com.tw/debian"
+		security="https://mirror.twds.com.tw/debian-security"
+		break
 	;;
 	2)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirrors.ustc.edu.cn/debian/ ${sver} main contrib non-free
-		deb-src https://mirrors.ustc.edu.cn/debian/ ${sver} main contrib non-free
-		deb https://mirrors.ustc.edu.cn/debian/ ${sver}-updates main contrib non-free
-		deb-src https://mirrors.ustc.edu.cn/debian/ ${sver}-updates main contrib non-free
-		deb https://mirrors.ustc.edu.cn/debian/ ${sver}-backports main contrib non-free
-		deb-src https://mirrors.ustc.edu.cn/debian/ ${sver}-backports main contrib non-free
-		deb https://mirrors.ustc.edu.cn/debian-security/ ${sver}-security main contrib non-free
-		deb-src https://mirrors.ustc.edu.cn/debian-security/ ${sver}-security main contrib non-free
-	EOF
-	break
-	;;  
+		mirror="http://free.nchc.org.tw/debian"
+		security="$DEBIAN_OFFICIAL_SECURITY"
+		break
+	;;
 	3)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirror.sjtu.edu.cn/debian/ ${sver} main non-free contrib
-		deb-src https://mirror.sjtu.edu.cn/debian/ ${sver} main non-free contrib
-		deb https://mirror.sjtu.edu.cn/debian/ ${sver}-security main
-		deb-src https://mirror.sjtu.edu.cn/debian/ ${sver}-security main
-		deb https://mirror.sjtu.edu.cn/debian/ ${sver}-updates main non-free contrib
-		deb-src https://mirror.sjtu.edu.cn/debian/ ${sver}-updates main non-free contrib
-		deb https://mirror.sjtu.edu.cn/debian/ ${sver}-backports main non-free contrib
-		deb-src https://mirror.sjtu.edu.cn/debian/ ${sver}-backports main non-free contrib
-	EOF
-	break
+		mirror="https://debian.cs.nycu.edu.tw/debian"
+		security="$DEBIAN_OFFICIAL_SECURITY"
+		break
 	;;
 	4)
-	cat > /etc/apt/sources.list <<-EOF
-		deb http://mirrors.aliyun.com/debian/ ${sver} main non-free contrib
-		deb-src http://mirrors.aliyun.com/debian/ ${sver} main non-free contrib
-		deb http://mirrors.aliyun.com/debian-security/ ${sver}-security main
-		deb-src http://mirrors.aliyun.com/debian-security/ ${sver}-security main
-		deb http://mirrors.aliyun.com/debian/ ${sver}-updates main non-free contrib
-		deb-src http://mirrors.aliyun.com/debian/ ${sver}-updates main non-free contrib
-		deb http://mirrors.aliyun.com/debian/ ${sver}-backports main non-free contrib
-		deb-src http://mirrors.aliyun.com/debian/ ${sver}-backports main non-free contrib
-	EOF
-	break
-	;;
-	5)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirrors.tencent.com/debian/ ${sver} main non-free contrib
-		deb-src https://mirrors.tencent.com/debian/ ${sver} main non-free contrib
-		deb https://mirrors.tencent.com/debian-security/ ${sver}-security main
-		deb-src https://mirrors.tencent.com/debian-security/ ${sver}-security main
-		deb https://mirrors.tencent.com/debian/ ${sver}-updates main non-free contrib
-		deb-src https://mirrors.tencent.com/debian/ ${sver}-updates main non-free contrib
-		deb https://mirrors.tencent.com/debian/ ${sver}-backports main non-free contrib
-		deb-src https://mirrors.tencent.com/debian/ ${sver}-backports main non-free contrib
-	EOF
-	break
-	;;
-	6)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirrors.163.com/debian/ ${sver} main non-free contrib
-		deb-src https://mirrors.163.com/debian/ ${sver} main non-free contrib
-		deb https://mirrors.163.com/debian-security/ ${sver}-security main
-		deb-src https://mirrors.163.com/debian-security/ ${sver}-security main
-		deb https://mirrors.163.com/debian/ ${sver}-updates main non-free contrib
-		deb-src https://mirrors.163.com/debian/ ${sver}-updates main non-free contrib
-		deb https://mirrors.163.com/debian/ ${sver}-backports main non-free contrib
-		deb-src https://mirrors.163.com/debian/ ${sver}-backports main non-free contrib
-	EOF
-	break
-	;;
-	7)
-	cat > /etc/apt/sources.list <<-EOF
-		deb https://mirrors.huaweicloud.com/debian/ ${sver} main non-free contrib
-		deb-src https://mirrors.huaweicloud.com/debian/ ${sver} main non-free contrib
-		deb https://mirrors.huaweicloud.com/debian-security/ ${sver}-security main
-		deb-src https://mirrors.huaweicloud.com/debian-security/ ${sver}-security main
-		deb https://mirrors.huaweicloud.com/debian/ ${sver}-updates main non-free contrib
-		deb-src https://mirrors.huaweicloud.com/debian/ ${sver}-updates main non-free contrib
-		deb https://mirrors.huaweicloud.com/debian/ ${sver}-backports main non-free contrib
-		deb-src https://mirrors.huaweicloud.com/debian/ ${sver}-backports main non-free contrib
-	EOF
-	break
+		mirror="http://ftp.tw.debian.org/debian"
+		security="$DEBIAN_OFFICIAL_SECURITY"
+		break
 	;;
 	*)
 	TIME r "請輸入正確編碼！"
 	;;
 	esac
 	done
+	[[ -f /etc/apt/sources.list ]] && cp -f /etc/apt/sources.list /etc/apt/backup/sources.list.bak
+	if is_deb822_release "$sver"; then
+		[[ -f /etc/apt/sources.list.d/debian.sources ]] && cp -f /etc/apt/sources.list.d/debian.sources /etc/apt/backup/debian.sources.bak
+		debian_sources_content "$sver" "$mirror" "$security" > /etc/apt/sources.list.d/debian.sources
+		# 舊格式檔案清空，避免與 debian.sources 重複
+		: > /etc/apt/sources.list
+	else
+		debian_sources_content "$sver" "$mirror" "$security" > /etc/apt/sources.list
+	fi
 	TIME g "apt源，更換完成!"
 }
-# CT範本國內源
+# CT範本台灣源
 ctsources() {
-	cp -rf /usr/share/perl5/PVE/APLInfo.pm /usr/share/perl5/PVE/APLInfo.pm.bak
-	echo " 請選擇您需要的CT範本國內源"
-	echo " 1. 清華大學鏡像站"
-	echo " 2. 中科大鏡像站"
+	local aplinfo=/usr/share/perl5/PVE/APLInfo.pm target
+	cp -rf $aplinfo $aplinfo.bak
+	echo " 請選擇您需要的CT範本源"
+	echo " 1. 台灣數位串流 TWDS"
+	echo " 2. Proxmox 官方源（還原）"
 	input="請輸入選擇[默認1]"
 	while :; do
 	read -t 30 -p " ${input}： " ctsource || echo
 	ctsource=${ctsource:-1}
 	case $ctsource in
 	1)
-	sed -i 's|http://download.proxmox.com|https://mirrors.tuna.tsinghua.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm
-	sed -i 's|http://mirrors.ustc.edu.cn/proxmox|https://mirrors.tuna.tsinghua.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm
-	break
+		target="$PVE_TW_PROXMOX_MIRROR"
+		break
 	;;
 	2)
-	sed -i 's|http://download.proxmox.com|http://mirrors.ustc.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm
-	sed -i 's|https://mirrors.tuna.tsinghua.edu.cn/proxmox|http://mirrors.ustc.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm
-	break
+		target="$PVE_OFFICIAL_PROXMOX"
+		break
 	;;
 	*)
 	TIME r "請輸入正確編碼！"
 	;;
 	esac
 	done
+	# 同時取代官方源與舊版指令碼設定過的鏡像站
+	sed -i -E "s#(https?://download\.proxmox\.com|https?://mirrors\.tuna\.tsinghua\.edu\.cn/proxmox|https?://mirrors\.ustc\.edu\.cn/proxmox|https?://mirror\.twds\.com\.tw/proxmox)/images#${target}/images#g" $aplinfo
 	TIME g "CT範本源，更換完成!"
 }
-# 更換使用幫助源
+# 更換Proxmox免訂閱源
 pvehelp(){
-	cp -rf /etc/apt/sources.list.d/pve-no-subscription.list /etc/apt/backup/pve-no-subscription.list.bak
-	cat > /etc/apt/sources.list.d/pve-no-subscription.list <<-EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/proxmox/debian ${sver} pve-no-subscription
-EOF
-	TIME g "使用幫助源，更換完成!"
-}
-# 關閉企業源
-pveenterprise(){
-	if [[ -f /etc/apt/sources.list.d/pve-enterprise.list ]];then
-		cp -rf /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/backup/pve-enterprise.list.bak
-		rm -rf /etc/apt/sources.list.d/pve-enterprise.list
-		TIME g "CT範本源，更換完成!"
+	local d=/etc/apt/sources.list.d f
+	if is_deb822_release "$sver"; then
+		# 移走舊的免訂閱源設定，避免重複
+		for f in pve-no-subscription.list proxmox.sources; do
+			[[ -f $d/$f ]] && mv -f $d/$f /etc/apt/backup/$f.bak
+		done
+		pve_sources_content "$sver" "$PVE_TW_PROXMOX_MIRROR" > $d/proxmox.sources
 	else
-		TIME g "pve-enterprise.list不存在，忽略!"
+		[[ -f $d/pve-no-subscription.list ]] && cp -rf $d/pve-no-subscription.list /etc/apt/backup/pve-no-subscription.list.bak
+		pve_sources_content "$sver" "$PVE_TW_PROXMOX_MIRROR" > $d/pve-no-subscription.list
 	fi
+	TIME g "Proxmox免訂閱源，更換完成!"
+}
+# 關閉企業源（PVE 與 Ceph）
+pveenterprise(){
+	local d=/etc/apt/sources.list.d f found=0
+	for f in $d/*.list $d/*.sources; do
+		[[ -f $f ]] || continue
+		grep -q "enterprise\.proxmox\.com" "$f" || continue
+		cp -f "$f" "/etc/apt/backup/$(basename "$f").bak"
+		if [[ $f == *.list ]]; then
+			sed -i -E 's|^([[:space:]]*deb.*enterprise\.proxmox\.com)|# \1|' "$f"
+		elif grep -q "^Enabled:" "$f"; then
+			sed -i 's/^Enabled:.*/Enabled: no/' "$f"
+		else
+			# 插在企業源 URIs 之後，確保屬於同一段設定
+			sed -i -E '/^URIs:.*enterprise\.proxmox\.com/a Enabled: no' "$f"
+		fi
+		TIME g "已關閉企業源：$(basename "$f")"
+		found=1
+	done
+	[[ $found -eq 1 ]] || TIME g "未找到企業源，忽略!"
 }
 # 移除無效訂閱
 novalidsub(){
-	# 移除 Proxmox VE 無有效訂閱提示 (6.4-5、6、8、9 、13；7.0-9、10、11已測試通過)
+	# 移除 Proxmox VE 無有效訂閱提示 (6.4-5、6、8、9 、13；7.0-9、10、11、9.2已測試通過)
 	cp -rf /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js.bak
 	sed -Ezi.bak "s/(Ext.Msg.show\(\{\s+title: gettext\('No valid sub)/void\(\{ \/\/\1/g" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
 	# sed -i 's#if (res === null || res === undefined || !res || res#if (false) {#g' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
@@ -247,21 +248,26 @@ novalidsub(){
 	TIME g "已移除訂閱提示!"
 }
 pvegpg(){
-	cp -rf /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg /etc/apt/backup/proxmox-release-${sver}.gpg.bak
-	rm -rf /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
-	wget -q --timeout=5 --tries=1 --show-progres http://mirrors.ustc.edu.cn/proxmox/debian/proxmox-release-${sver}.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
-	if [[ $? -ne 0 ]];then
-		TIME r "嘗試重新下載..."
-		wget -q --timeout=5 --tries=1 --show-progres http://mirrors.ustc.edu.cn/proxmox/debian/proxmox-release-${sver}.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
-			if [[ $? -ne 0 ]];then
-				TIME r "下載秘鑰失敗，請檢查網路再嘗試!"
-				sleep 2
-				exit 1
-		else
-			TIME g "密匙下載完成!"
-			fi
+	# PVE 9 起金鑰由 proxmox-archive-keyring 套件提供，不需另外下載
+	if is_deb822_release "$sver"; then
+		if [[ -f $PVE_ARCHIVE_KEYRING ]]; then
+			TIME g "已使用系統內建的 Proxmox 金鑰!"
+			return 0
+		fi
+		TIME r "找不到 $PVE_ARCHIVE_KEYRING，請先安裝 proxmox-archive-keyring 套件!"
+		exit 1
+	fi
+	# 台灣鏡像站未提供金鑰檔，改從 Proxmox 官方下載
+	[[ -f /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg ]] && cp -rf /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg /etc/apt/backup/proxmox-release-${sver}.gpg.bak
+	local url="$PVE_OFFICIAL_PROXMOX/debian/proxmox-release-${sver}.gpg" tmp=/etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg.tmp
+	if wget -q --timeout=5 --tries=2 "$url" -O "$tmp" && [[ -s $tmp ]]; then
+		mv -f "$tmp" /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
+		TIME g "金鑰下載完成!"
 	else
-		TIME g "密匙下載完成!"	
+		rm -f "$tmp"
+		TIME r "下載金鑰失敗，請檢查網路再嘗試!"
+		sleep 2
+		exit 1
 	fi
 }
 pve_optimization(){
@@ -276,7 +282,7 @@ pve_optimization(){
 	TIME y "※※※※※ 更換CT範本源... ※※※※※"
 	ctsources
 	echo
-	TIME y "※※※※※ 更換使用幫助源... ※※※※※"
+	TIME y "※※※※※ 更換Proxmox免訂閱源... ※※※※※"
 	pvehelp
 	echo
 	TIME y "※※※※※ 關閉企業源... ※※※※※"
@@ -285,7 +291,7 @@ pve_optimization(){
 	TIME y "※※※※※ 移除 Proxmox VE 無有效訂閱提示... ※※※※※"
 	novalidsub
 	echo
-	TIME y "※※※※※ 下載PVE7.0源的密匙... ※※※※※"
+	TIME y "※※※※※ 設定Proxmox套件金鑰... ※※※※※"
 	pvegpg
 	echo
 	TIME y "※※※※※ 重新載入服務組態檔案、重啟web控制台... ※※※※※"
@@ -532,7 +538,7 @@ cpupower_del(){
 
 
 #--------------CPU、主機板、硬碟溫度顯示----------------
-# 適用 PVE 8。採集工作在 root systemd service 執行，API 僅讀取 JSON 快取。
+# 適用 PVE 8 與 PVE 9。採集工作在 root systemd service 執行，API 僅讀取 JSON 快取。
 
 pve_hw_require(){
     if [ "${EUID}" -ne 0 ]; then
@@ -541,8 +547,8 @@ pve_hw_require(){
     fi
     command -v pveversion >/dev/null || return 1
     case "$(pveversion | cut -d/ -f2)" in
-        8.*) ;;
-        *) echo "此資訊顯示修正版目前支援 PVE 8；其他版本請先驗證相容性。" >&2; return 1 ;;
+        8.*|9.*) ;;
+        *) echo "此資訊顯示修正版目前支援 PVE 8 與 PVE 9；其他版本請先驗證相容性。" >&2; return 1 ;;
     esac
 }
 
@@ -1012,7 +1018,7 @@ menu(){
 
 `TIME y "	      PVE最佳化指令碼     "`
 ┌──────────────────────────────────────────┐
-    1. 一鍵最佳化PVE(換源、去訂閱等)
+    1. 一鍵最佳化PVE(換台灣源、去訂閱等)
     2. 組態PCI硬體直通
     3. 設定CPU電源模式
     4. 加入CPU、主機板、硬碟溫度顯示
