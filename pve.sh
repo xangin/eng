@@ -532,556 +532,478 @@ cpupower_del(){
 
 
 #--------------CPU、主機板、硬碟溫度顯示----------------
+# 適用 PVE 8。採集工作在 root systemd service 執行，API 僅讀取 JSON 快取。
 
-# 安裝工具
-cpu_add(){
-
-nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
-pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
-proxmoxlib="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-
-pvever=$(pveversion | awk -F"/" '{print $2}')
-echo pve版本$pvever
-
-# 判斷是否已經執行過修改
-[ ! -e $nodes.$pvever.bak ] || { echo 已經執行過修改，請勿重複執行; exit 1;}
-
-# 輸入需要安裝的軟體包
-packages=(lm-sensors nvme-cli sysstat linux-cpupower)
-
-# 查詢軟體包，判斷是否安裝
-for package in "${packages[@]}"; do
-    if ! dpkg -s "$package" &> /dev/null; then
-        echo "$package 未安裝，開始安裝軟體包"
-        apt-get install "${packages[@]}" -y
-        modprobe msr
-        install=ok
-        break
+pve_hw_require(){
+    if [ "${EUID}" -ne 0 ]; then
+        echo "請以 root 執行。" >&2
+        return 1
     fi
-done
+    command -v pveversion >/dev/null || return 1
+    case "$(pveversion | cut -d/ -f2)" in
+        8.*) ;;
+        *) echo "此資訊顯示修正版目前支援 PVE 8；其他版本請先驗證相容性。" >&2; return 1 ;;
+    esac
+}
 
-# 設定執行權限
-if dpkg -s "linux-cpupower" &> /dev/null; then
-    chmod +s /usr/sbin/linux-cpupower || echo "Failed to set permissions for /usr/sbin/linux-cpupower"
-fi
-
-chmod +s /usr/sbin/nvme
-chmod +s /usr/sbin/hddtemp
-chmod +s /usr/sbin/smartctl
-chmod +s /usr/sbin/turbostat || echo "Failed to set permissions for /usr/sbin/turbostat"
-modprobe msr && echo msr > /etc/modules-load.d/turbostat-msr.conf
-
-
-# 軟體包安裝完成
-if [ "$install" == "ok" ]; then
-    echo 軟體包安裝完成，檢測硬體資訊
-sensors-detect --auto > /tmp/sensors
-drivers=`sed -n '/Chip drivers/,/\#----cut here/p' /tmp/sensors|sed '/Chip /d'|sed '/cut/d'`
-if [ `echo $drivers|wc -w` = 0 ];then
-    echo 沒有找到任何驅動，似乎你的系統不支援或驅動安裝失敗。
-    pause
-    menu
-else
-    for i in $drivers
-    do
-        modprobe $i
-        if [ `grep $i /etc/modules|wc -l` = 0 ];then
-            echo $i >> /etc/modules
+# 從目前已安裝版本的官方套件取得原始檔，避免覆寫舊備份或重複插入程式碼。
+pve_hw_pristine(){
+    local stage="$1" version="$2" candidate deb=""
+    for candidate in /var/cache/apt/archives/pve-manager_*_all.deb; do
+        [ -f "$candidate" ] || continue
+        if [ "$(dpkg-deb -f "$candidate" Package)" = pve-manager ] &&
+           [ "$(dpkg-deb -f "$candidate" Version)" = "$version" ]; then
+            deb="$candidate"
+            break
         fi
     done
-    sensors
-    sleep 3
-    echo 驅動資訊組態成功。
-fi
-/etc/init.d/kmod start
-rm /tmp/sensors
-# 驅動資訊組態完成
-fi
-
-echo 備份原始檔
-# 刪除舊版本備份檔案
-rm -f  $nodes.*.bak
-rm -f  $pvemanagerlib.*.bak
-rm -f  $proxmoxlib.*.bak
-# 備份當前版本檔案
-[ ! -e $nodes.$pvever.bak ] && cp $nodes $nodes.$pvever.bak
-[ ! -e $pvemanagerlib.$pvever.bak ] && cp $pvemanagerlib $pvemanagerlib.$pvever.bak
-[ ! -e $proxmoxlib.$pvever.bak ] && cp $proxmoxlib $proxmoxlib.$pvever.bak
-
-# 生成系統變數
-tmpf=tmpfile.temp
-touch $tmpf
-cat > $tmpf << 'EOF' 
-	$res->{thermalstate} = `sensors`;
-	$res->{cpusensors} = `cat /proc/cpuinfo | grep MHz && lscpu | grep MHz`;
-	
-	my $nvme0_temperatures = `smartctl -a /dev/nvme0|grep -E "Model Number|(?=Total|Namespace)[^:]+Capacity|Temperature:|Available Spare:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"`;
-	my $nvme0_io = `iostat -d -x -k 1 1 | grep -E "^nvme0"`;
-	$res->{nvme0_status} = $nvme0_temperatures . $nvme0_io;
-	
-	$res->{hdd_temperatures} = `smartctl -a /dev/sd?|grep -E "Device Model|Capacity|Power_On_Hours|Temperature"`;
-
-	my $powermode = `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor && turbostat -S -q -s PkgWatt -i 0.1 -n 1 -c package | grep -v PkgWatt`;
-	$res->{cpupower} = $powermode;
-
-EOF
-
-###################  修改node.pm   ##########################
-echo 修改node.pm：
-echo 找到關鍵字 PVE::pvecfg::version_text 的行號並跳到下一行
-# 顯示匹配的行
-ln=$(expr $(sed -n -e '/PVE::pvecfg::version_text/=' $nodes) + 1)
-echo "匹配的行號：" $ln
-
-echo 修改結果：
-sed -i "${ln}r $tmpf" $nodes
-# 顯示修改結果
-sed -n '/PVE::pvecfg::version_text/,+18p' $nodes
-rm $tmpf
-
-
-
-###################  修改pvemanagerlib.js   ##########################
-tmpf=tmpfile.temp
-touch $tmpf
-cat > $tmpf << 'EOF'
-
-	{
-          itemId: 'CPUW',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU功耗'),
-          textField: 'cpupower',
-          renderer:function(value){
-			  const w0 = value.split('\n')[0].split(' ')[0];
-			  const w1 = value.split('\n')[1].split(' ')[0];
-			  return `CPU電源模式: ${w0} | CPU功耗: ${w1} W `
-            }
-	},
-
-	{
-          itemId: 'MHz',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU頻率'),
-          textField: 'cpusensors',
-          renderer:function(value){
-			  const f0 = value.match(/cpu MHz.*?([\d]+)/)[1];
-			  const f1 = value.match(/CPU min MHz.*?([\d]+)/)[1];
-			  const f2 = value.match(/CPU max MHz.*?([\d]+)/)[1];
-			  return `CPU即時: ${f0} MHz | 最小: ${f1} MHz | 最大: ${f2} MHz `
-            }
-	},
-	
-	{
-          itemId: 'thermal',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU溫度'),
-          textField: 'thermalstate',
-          renderer:function(value){
-              // const p0 = value.match(/Package id 0.*?\+([\d\.]+)Â/)[1];  // CPU包溫度
-              const c0 = value.match(/Core 0.*?\+([\d\.]+)?/)[1];  // CPU核心1溫度
-              const c1 = value.match(/Core 1.*?\+([\d\.]+)?/)[1];  // CPU核心2溫度
-              const c2 = value.match(/Core 2.*?\+([\d\.]+)?/)[1];  // CPU核心3溫度
-              const c3 = value.match(/Core 3.*?\+([\d\.]+)?/)[1];  // CPU核心4溫度
-              const b0 = value.match(/temp1.*?\+([\d\.]+)?/)[1];  // 主機板溫度
-              return ` 核心1: ${c0} ℃ | 核心2: ${c1} ℃ | 核心3: ${c2} ℃ | 核心4: ${c3} ℃ || 主機板: ${b0} ℃ `
-            }
-    },
-
-
-
-	{
-          itemId: 'HEXIN',
-          colspan: 2,
-          printBar: false,
-          title: gettext('核心頻率'),
-          textField: 'cpusensors',
-          renderer:function(value){
-			  const e0 = value.split('\n')[0].split(' ')[2];
-			  const e1 = value.split('\n')[1].split(' ')[2];
-			  const e2 = value.split('\n')[2].split(' ')[2];
-			  const e3 = value.split('\n')[3].split(' ')[2];
-			  return `核心1: ${e0} MHz | 核心2: ${e1} MHz | 核心3: ${e2} MHz | 核心4: ${e3} MHz `
-            }
-	},
-
-
-	
-	/* 檢測不到相關參數的可以註釋掉---需要的註釋本行即可
-	// 風扇轉速
-	{
-          itemId: 'RPM',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU風扇'),
-          textField: 'thermalstate',
-          renderer:function(value){
-			  const fan1 = value.match(/fan1:.*?\ ([\d.]+) R/)[1];
-			  const fan2 = value.match(/fan2:.*?\ ([\d.]+) R/)[1];
-			  if (fan1 === "0") {
-			    fan11 = "停轉";
-			  } else {
-			    fan11 = fan1 + " RPM";
-			  }
-			  if (fan2 === "0") {
-			    fan22 = "停轉";
-			  } else {
-			    fan22 = fan2 + " RPM";
-			  }
-			  return `CPU風扇: ${fan11} | 系統風扇: ${fan22}`
-            }
-	},
-	檢測不到相關參數的可以註釋掉---需要的註釋本行即可  */
-
-	// /* 檢測不到相關參數的可以註釋掉---需要的註釋本行即可
-	// NVME硬碟溫度
-	{
-	    itemId: 'nvme0-status',
-	    colspan: 2,
-	    printBar: false,
-	    title: gettext('NVME 硬碟'),
-	    textField: 'nvme0_status',
-	    renderer:function(value){
-	        if (value.length > 0) {
-	            value = value.replace(/Â/g, '');
-	            let data = [];
-	            let nvmes = value.matchAll(/(^(?:Model|Total|Temperature:|Available Spare:|Percentage|Data|Power|Unsafe|Integrity Errors|nvme)[\s\S]*)+/gm);
-	            for (const nvme of nvmes) {
-	                let nvmeNumber = 0;
-	                data[nvmeNumber] = {
-	                    Models: [],
-	                    Integrity_Errors: [],
-	                    Capacitys: [],
-	                    Temperatures: [],
-	                    Available_Spares: [],
-	                    Useds: [],
-	                    Reads: [],
-	                    Writtens: [],
-	                    Cycles: [],
-	                    Hours: [],
-	                    Shutdowns: [],
-	                    States: [],
-	                    r_kBs: [],
-	                    r_awaits: [],
-	                    w_kBs: [],
-	                    w_awaits: [],
-	                    utils: []
-	                };
-
-	                let Models = nvme[1].matchAll(/^Model Number: *([ \S]*)$/gm);
-	                for (const Model of Models) {
-	                    data[nvmeNumber]['Models'].push(Model[1]);
-	                }
-
-	                let Integrity_Errors = nvme[1].matchAll(/^Media and Data Integrity Errors: *([ \S]*)$/gm);
-	                for (const Integrity_Error of Integrity_Errors) {
-	                    data[nvmeNumber]['Integrity_Errors'].push(Integrity_Error[1]);
-	                }
-
-	                let Capacitys = nvme[1].matchAll(/^(?=Total|Namespace)[^:]+Capacity:[^\[]*\[([ \S]*)\]$/gm);
-	                for (const Capacity of Capacitys) {
-	                    data[nvmeNumber]['Capacitys'].push(Capacity[1]);
-	                }
-
-	                let Temperatures = nvme[1].matchAll(/^Temperature: *([\d]*)[ \S]*$/gm);
-	                for (const Temperature of Temperatures) {
-	                    data[nvmeNumber]['Temperatures'].push(Temperature[1]);
-	                }
-
-	                let Available_Spares = nvme[1].matchAll(/^Available Spare: *([\d]*%)[ \S]*$/gm);
-	                for (const Available_Spare of Available_Spares) {
-	                    data[nvmeNumber]['Available_Spares'].push(Available_Spare[1]);
-	                }
-
-	                let Useds = nvme[1].matchAll(/^Percentage Used: *([ \S]*)%$/gm);
-	                for (const Used of Useds) {
-	                    data[nvmeNumber]['Useds'].push(Used[1]);
-	                }
-
-	                let Reads = nvme[1].matchAll(/^Data Units Read:[^\[]*\[([ \S]*)\]$/gm);
-	                for (const Read of Reads) {
-	                    data[nvmeNumber]['Reads'].push(Read[1]);
-	                }
-
-	                let Writtens = nvme[1].matchAll(/^Data Units Written:[^\[]*\[([ \S]*)\]$/gm);
-	                for (const Written of Writtens) {
-	                    data[nvmeNumber]['Writtens'].push(Written[1]);
-	                }
-
-	                let Cycles = nvme[1].matchAll(/^Power Cycles: *([ \S]*)$/gm);
-	                for (const Cycle of Cycles) {
-	                    data[nvmeNumber]['Cycles'].push(Cycle[1]);
-	                }
-
-	                let Hours = nvme[1].matchAll(/^Power On Hours: *([ \S]*)$/gm);
-	                for (const Hour of Hours) {
-	                    data[nvmeNumber]['Hours'].push(Hour[1]);
-	                }
-
-	                let Shutdowns = nvme[1].matchAll(/^Unsafe Shutdowns: *([ \S]*)$/gm);
-	                for (const Shutdown of Shutdowns) {
-	                    data[nvmeNumber]['Shutdowns'].push(Shutdown[1]);
-	                }
-
-	                let States = nvme[1].matchAll(/^nvme\S+(( *\d+\.\d{2}){22})/gm);
-	                for (const State of States) {
-	                    data[nvmeNumber]['States'].push(State[1]);
-	                    const IO_array = [...State[1].matchAll(/\d+\.\d{2}/g)];
-	                    if (IO_array.length > 0) {
-	                        data[nvmeNumber]['r_kBs'].push(IO_array[1]);
-	                        data[nvmeNumber]['r_awaits'].push(IO_array[4]);
-	                        data[nvmeNumber]['w_kBs'].push(IO_array[7]);
-	                        data[nvmeNumber]['w_awaits'].push(IO_array[10]);
-	                        data[nvmeNumber]['utils'].push(IO_array[21]);
-	                    }
-	                }
-
-	                let output = '';
-	                for (const [i, nvme] of data.entries()) {
-	                    if (nvme.Models.length > 0) {
-	                        for (const nvmeModel of nvme.Models) {
-	                            output += `${nvmeModel}`;
-	                        }
-	                    }
-
-	                    if (nvme.Integrity_Errors.length > 0) {
-	                        for (const nvmeIntegrity_Error of nvme.Integrity_Errors) {
-	                            if (nvmeIntegrity_Error != 0) {
-	                                output += ` (`;
-	                                output += `0E: ${nvmeIntegrity_Error}-故障！`;
-	                                if (nvme.Available_Spares.length > 0) {
-	                                    output += ', ';
-	                                    for (const Available_Spare of nvme.Available_Spares) {
-	                                        output += `備用空間: ${Available_Spare}`;
-	                                    }
-	                                }
-	                                output += `)`;
-	                            }
-	                        }
-	                    }
-
-	                    if (nvme.Capacitys.length > 0) {
-	                        output += ' | ';
-	                        for (const nvmeCapacity of nvme.Capacitys) {
-	                            output += `容量: ${nvmeCapacity.replace(/ |,/gm, '')}`;
-	                        }
-	                    }
-
-	                    if (nvme.Useds.length > 0) {
-	                        output += ' | ';
-	                        for (const nvmeUsed of nvme.Useds) {
-	                            output += `壽命: ${100-Number(nvmeUsed)}% `;
-	                            if (nvme.Reads.length > 0) {
-	                                output += '(';
-	                                for (const nvmeRead of nvme.Reads) {
-	                                    output += `已讀${nvmeRead.replace(/ |,/gm, '')}`;
-	                                    output += ')';
-	                                }
-	                            }
-
-	                            if (nvme.Writtens.length > 0) {
-	                                output = output.slice(0, -1);
-	                                output += ', ';
-	                                for (const nvmeWritten of nvme.Writtens) {
-	                                    output += `已寫${nvmeWritten.replace(/ |,/gm, '')}`;
-	                                }
-	                                output += ')';
-	                            }
-	                        }
-	                    }
-
-	                    if (nvme.Temperatures.length > 0) {
-	                        output += ' | ';
-	                        for (const nvmeTemperature of nvme.Temperatures) {
-	                            output += `溫度: ${nvmeTemperature}°C`;
-	                        }
-	                    }
-
-	                    if (nvme.States.length > 0) {
-	                        if (nvme.Models.length > 0) {
-	                            output += '\n';
-	                        }
-
-	                        output += 'I/O: ';
-	                        if (nvme.r_kBs.length > 0 || nvme.r_awaits.length > 0) {
-	                            output += '讀-';
-	                            if (nvme.r_kBs.length > 0) {
-	                                for (const nvme_r_kB of nvme.r_kBs) {
-	                                    var nvme_r_mB = `${nvme_r_kB}` / 1024;
-	                                    nvme_r_mB = nvme_r_mB.toFixed(2);
-	                                    output += `速度${nvme_r_mB}MB/s`;
-	                                }
-	                            }
-	                            if (nvme.r_awaits.length > 0) {
-	                                for (const nvme_r_await of nvme.r_awaits) {
-	                                    output += `, 延遲${nvme_r_await}ms / `;
-	                                }
-	                            }
-	                        }
-
-	                        if (nvme.w_kBs.length > 0 || nvme.w_awaits.length > 0) {
-	                            output += '寫-';
-	                            if (nvme.w_kBs.length > 0) {
-	                                for (const nvme_w_kB of nvme.w_kBs) {
-	                                    var nvme_w_mB = `${nvme_w_kB}` / 1024;
-	                                    nvme_w_mB = nvme_w_mB.toFixed(2);
-	                                    output += `速度${nvme_w_mB}MB/s`;
-	                                }
-	                            }
-	                            if (nvme.w_awaits.length > 0) {
-	                                for (const nvme_w_await of nvme.w_awaits) {
-	                                    output += `, 延遲${nvme_w_await}ms | `;
-	                                }
-	                            }
-	                        }
-
-	                        if (nvme.utils.length > 0) {
-	                            for (const nvme_util of nvme.utils) {
-	                                output += `負載${nvme_util}%`;
-	                            }
-	                        }
-	                    }
-
-                        if (nvme.Cycles.length > 0) {
-                            output += '\n';
-                            for (const nvmeCycle of nvme.Cycles) {
-                                output += `通電: ${nvmeCycle.replace(/ |,/gm, '')}次`;
-                            }
-
-                            if (nvme.Shutdowns.length > 0) {
-                                output += ', ';
-                                for (const nvmeShutdown of nvme.Shutdowns) {
-                                    output += `不安全斷電${nvmeShutdown.replace(/ |,/gm, '')}次`;
-                                    break
-                                }
-                            }
-
-                            if (nvme.Hours.length > 0) {
-                                output += ', ';
-                                for (const nvmeHour of nvme.Hours) {
-                                    output += `累計${nvmeHour.replace(/ |,/gm, '')}小時`;
-                                }
-                            }
-                        }
-	                    //output = output.slice(0, -3);
-	                }
-	                return output.replace(/\n/g, '<br>');
-	            }
-	        } else {
-	            return `提示: 未安裝 NVME 或已直通 NVME 控製器！`;
-	        }
-	    }
-	},
-	// 檢測不到相關參數的可以註釋掉---需要的註釋本行即可  */
-
-          // SATA硬碟溫度
-          {
-          itemId: 'hdd-temperatures',
-          colspan: 2,
-          printBar: false,
-          title: gettext('SATA硬碟'),
-          textField: 'hdd_temperatures',
-          renderer:function(value){
-          if (value.length > 0) {
-          let devices = value.matchAll(/(\s*Model.*:\s*[\s\S]*?\n){1,2}^User.*\[([\s\S]*?)\]\n^\s*9[\s\S]*?\-\s*([\d]+)[\s\S]*?(\n(^19[0,4][\s\S]*?$){1,2}|\s{0}$)/gm);
-          for (const device of devices) {
-          if(device[1].indexOf("Family") !== -1){
-          devicemodel = device[1].replace(/.*Model Family:\s*([\s\S]*?)\n^Device Model:\s*([\s\S]*?)\n/m, '$1 - $2');
-          } else {
-          devicemodel = device[1].replace(/.*Model:\s*([\s\S]*?)\n/m, '$1');
-          }
-          device[2] = device[2].replace(/ |,/gm, '');
-          if(value.indexOf("Min/Max") !== -1){
-          let devicetemps = device[5].matchAll(/19[0,4][\s\S]*?\-\s*(\d+)(\s\(Min\/Max\s(\d+)\/(\d+)\)$|\s{0}$)/gm);
-          for (const devicetemp of devicetemps) {
-          value = `${devicemodel} | 容量: ${device[2]} | 已通電: ${device[3]}小時 | 溫度: ${devicetemp[1]}°C\n`;
-          }
-          } else if (value.indexOf("Temperature") !== -1){
-          let devicetemps = device[5].matchAll(/19[0,4][\s\S]*?\-\s*(\d+)/gm);
-          for (const devicetemp of devicetemps) {
-          value = `${devicemodel} | 容量: ${device[2]} | 已通電: ${device[3]}小時 | 溫度: ${devicetemp[1]}°C\n`;
-          }
-          } else {
-          value = `${devicemodel} | 容量: ${device[2]} | 已通電: ${device[3]}小時 | 提示: 未檢測到溫度感測器\n`;
-          }
-          }
-          return value.replace(/\n/g, '<br>');
-          } else { 
-          return `提示: 未安裝硬碟或已直通硬碟控製器`;
-          }
-          }
-          },
-EOF
-
-echo 找到關鍵字pveversion的行號
-# 顯示匹配的行
-ln=$(sed -n '/pveversion/,+10{/},/{=;q}}' $pvemanagerlib)
-echo "匹配的行號pveversion：" $ln
-
-echo 修改結果：
-sed -i "${ln}r $tmpf" $pvemanagerlib
-# 顯示修改結果
-# sed -n '/pveversion/,+30p' $pvemanagerlib
-rm $tmpf
-
-
-echo 修改頁面高度
-# 修改並顯示修改結果,位置10288行,原始值400
-# sed -i -r '/\[logView\]/,+5{/heigh/{s#[0-9]+#700#;}}' $pvemanagerlib
-# sed -n '/\[logView\]/,+5{/heigh/{p}}' $pvemanagerlib
-# 修改並顯示修改結果,位置36495行,原始值300
-sed -i -r '/widget\.pveNodeStatus/,+5{/height/{s#[0-9]+#480#}}' $pvemanagerlib
-sed -n '/widget\.pveNodeStatus/,+5{/height/{p}}' $pvemanagerlib
-## 兩處 height 的值需按情況修改，每多一行資料增加 20
-
-# 調整顯示佈局
-ln=$(expr $(sed -n -e '/widget.pveDcGuests/=' $pvemanagerlib) + 10)
-sed -i "${ln}a\		textAlign: 'right'," $pvemanagerlib
-ln=$(expr $(sed -n -e '/widget.pveNodeStatus/=' $pvemanagerlib) + 10)
-sed -i "${ln}a\		textAlign: 'right'," $pvemanagerlib
-
-###################  修改proxmoxlib.js   ##########################
-
-
-echo 修改去除訂閱彈窗
-sed -r -i '/\/nodes\/localhost\/subscription/,+10{/^\s+if \(res === null /{N;s#.+#\t\t  if(false){#}}' $proxmoxlib
-# 顯示修改結果
-sed -n '/\/nodes\/localhost\/subscription/,+10p' $proxmoxlib
-
-systemctl restart pveproxy
-
-echo "請刷新瀏覽器快取shift+f5"
-
-
+    if [ -z "$deb" ]; then
+        (cd "$stage" && apt-get download "pve-manager=$version")
+        for candidate in "$stage"/pve-manager_*.deb; do
+            [ -f "$candidate" ] || continue
+            if [ "$(dpkg-deb -f "$candidate" Package)" = pve-manager ] &&
+               [ "$(dpkg-deb -f "$candidate" Version)" = "$version" ]; then
+                deb="$candidate"
+                break
+            fi
+        done
+    fi
+    [ -n "$deb" ] || { echo "無法取得目前版本的 pve-manager 原始套件。" >&2; return 1; }
+    dpkg-deb -x "$deb" "$stage/package"
 }
 
-# 刪除工具
-cpu_del(){
-
-nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
-pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
-proxmoxlib="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-
-pvever=$(pveversion | awk -F"/" '{print $2}')
-echo pve版本$pvever
-if [ -f "$nodes.$pvever.bak" ];then
-rm -f $nodes $pvemanagerlib $proxmoxlib
-mv $nodes.$pvever.bak $nodes
-mv $pvemanagerlib.$pvever.bak $pvemanagerlib
-mv $proxmoxlib.$pvever.bak $proxmoxlib
-
-echo "已刪除溫度顯示，請重新刷新瀏覽器快取."
-else
-echo "你沒有加入過溫度顯示，退出指令碼."
-fi
-
-
+# 只接管本功能與舊版選項 4 的修改；遇到其他客製內容先停止。
+pve_hw_check_existing(){
+    python3 - "$1" <<'PVE_HW_CHECK_PY'
+from pathlib import Path
+import sys
+base = Path(sys.argv[1]) / 'package'
+files = [('/usr/share/perl5/PVE/API2/Nodes.pm', ('BEGIN local hardware summary', '$res->{thermalstate}')),
+         ('/usr/share/pve-manager/js/pvemanagerlib.js', ('BEGIN local hardware summary', "itemId: 'CPUW'"))]
+for filename, markers in files:
+    current = Path(filename).read_text()
+    original = (base / filename.lstrip('/')).read_text()
+    if current != original and not any(marker in current for marker in markers):
+        raise SystemExit('檔案含有未識別的客製修改，為避免覆寫已停止：' + filename)
+PVE_HW_CHECK_PY
 }
+
+pve_hw_atomic_install(){
+    local source="$1" destination="$2" mode="$3"
+    install -m "$mode" "$source" "${destination}.pve-hardware-new"
+    mv -f -- "${destination}.pve-hardware-new" "$destination"
+}
+
+# 延後優雅重新載入，確保網頁 Shell 斷線時安裝已完整提交。
+pve_hw_reload_later(){
+    systemd-run --quiet --unit="pve-hardware-ui-reload-${BASHPID}-${RANDOM}" \
+        --on-active=3s --collect /bin/systemctl reload pvedaemon pveproxy
+}
+
+cpu_add(){ (
+    set -euo pipefail
+    pve_hw_require
+    if ! command -v python3 >/dev/null || ! command -v smartctl >/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 smartmontools
+    fi
+    local stage version backup deployment_started=0
+    stage=$(mktemp -d /var/tmp/pve-hardware.XXXXXX)
+    version=$(dpkg-query -W -f='${Version}' pve-manager)
+    backup="/var/lib/pve-hardware-summary/backups/$version"
+    pve_hw_add_cleanup(){
+        local result=$?
+        trap - EXIT HUP INT TERM
+        set +e
+        if [ "$result" -ne 0 ] && [ "$deployment_started" -eq 1 ]; then
+            pve_hw_atomic_install "$stage/Nodes.pm.before" /usr/share/perl5/PVE/API2/Nodes.pm 644
+            pve_hw_atomic_install "$stage/pvemanagerlib.js.before" /usr/share/pve-manager/js/pvemanagerlib.js 644
+            pve_hw_reload_later
+            echo "安裝未完成，已回復本次修改前的 API 與介面檔案。" >&2
+        fi
+        rm -rf -- "$stage"
+        exit "$result"
+    }
+    trap pve_hw_add_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    pve_hw_pristine "$stage" "$version"
+    pve_hw_check_existing "$stage"
+    cp -a /usr/share/perl5/PVE/API2/Nodes.pm "$stage/Nodes.pm.before"
+    cp -a /usr/share/pve-manager/js/pvemanagerlib.js "$stage/pvemanagerlib.js.before"
+    cat > "$stage/pve-hardware-status.py" <<'PVE_HW_COLLECTOR_PY'
+#!/usr/bin/python3
+"""Cache read-only hardware telemetry for the local Proxmox summary page."""
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+
+CACHE = Path('/run/pve-hardware-status.json')
+
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def number(path, divisor=1):
+    try:
+        value = float(read(path)) / divisor
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def main():
+    now = time.time()
+    data = {'updated_at': int(now), 'cpu_temperatures': [], 'board_temperatures': [],
+            'fans': [], 'frequencies_mhz': [], 'disks': []}
+    for hwmon in sorted(Path('/sys/class/hwmon').glob('hwmon*')):
+        name = read(hwmon / 'name') or hwmon.name
+        for value_file in sorted(hwmon.glob('temp*_input')):
+            temperature = number(value_file, 1000)
+            if temperature is None:
+                continue
+            label = read(value_file.with_name(value_file.name.replace('_input', '_label'))) or name
+            item = {'label': label, 'celsius': round(temperature, 1)}
+            if name in ('coretemp', 'k10temp', 'zenpower'):
+                data['cpu_temperatures'].append(item)
+            elif not name.startswith(('iwlwifi', 'nvme', 'acpitz')):
+                data['board_temperatures'].append(item)
+        for value_file in sorted(hwmon.glob('fan*_input')):
+            rpm = number(value_file)
+            if rpm is not None:
+                label = read(value_file.with_name(value_file.name.replace('_input', '_label'))) or value_file.stem
+                data['fans'].append({'label': label, 'rpm': int(rpm)})
+
+    cpus = sorted(Path('/sys/devices/system/cpu').glob('cpu[0-9]*'),
+                  key=lambda path: int(path.name[3:]))
+    for cpu in cpus:
+        frequency = number(cpu / 'cpufreq/scaling_cur_freq', 1000)
+        if frequency is not None:
+            data['frequencies_mhz'].append({'cpu': int(cpu.name[3:]), 'mhz': round(frequency)})
+    data['governor'] = read('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor')
+    data['min_mhz'] = number('/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq', 1000)
+    data['max_mhz'] = number('/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq', 1000)
+
+    # Package power only; it is not the whole computer's wall-socket consumption.
+    rapl = Path('/sys/class/powercap/intel-rapl:0')
+    first = number(rapl / 'energy_uj')
+    limit = number(rapl / 'max_energy_range_uj')
+    data['package_watts'] = None
+    if first is not None and limit and (read(rapl / 'name') or '').startswith('package-'):
+        start = time.monotonic()
+        time.sleep(0.2)
+        second = number(rapl / 'energy_uj')
+        duration = time.monotonic() - start
+        if second is not None:
+            data['package_watts'] = round(((second - first) % limit) / 1000000 / duration, 2)
+
+    # Avoid repeated SMART reads on each web request; refresh disk data once a minute.
+    try:
+        previous = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    if 0 <= now - previous.get('disks_updated_at', 0) < 60:
+        data['disks'] = previous.get('disks', [])
+        data['disks_updated_at'] = previous['disks_updated_at']
+    else:
+        data['disks_updated_at'] = int(now)
+        for block in sorted(Path('/sys/block').iterdir()):
+            if not re.fullmatch(r'sd[a-z]+|nvme[0-9]+n[0-9]+', block.name):
+                continue
+            if read(block / 'removable') != '0':
+                continue
+            try:
+                result = subprocess.run(['/usr/sbin/smartctl', '-j', '-n', 'standby', '-A', '-i', '/dev/' + block.name],
+                                        capture_output=True, text=True, timeout=3)
+                disk = json.loads(result.stdout)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                continue
+            item = {'device': block.name, 'model': disk.get('model_name') or disk.get('model_number') or block.name,
+                    'bytes': disk.get('user_capacity', {}).get('bytes'),
+                    'hours': disk.get('power_on_time', {}).get('hours'),
+                    'celsius': disk.get('temperature', {}).get('current')}
+            data['disks'].append(item)
+
+    temporary = CACHE.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(data, ensure_ascii=False, allow_nan=False) + '\n')
+    temporary.chmod(0o644)
+    os.replace(temporary, CACHE)
+
+
+if __name__ == '__main__':
+    main()
+PVE_HW_COLLECTOR_PY
+    cat > "$stage/pve-hardware-status.service" <<'PVE_HW_SERVICE'
+[Unit]
+Description=Cache hardware readings for Proxmox node summary
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/pve-hardware-status.py
+TimeoutStartSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run
+PrivateTmp=yes
+PVE_HW_SERVICE
+    cat > "$stage/pve-hardware-status.timer" <<'PVE_HW_TIMER'
+[Unit]
+Description=Refresh Proxmox hardware readings every ten seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=pve-hardware-status.service
+
+[Install]
+WantedBy=timers.target
+PVE_HW_TIMER
+    cat > "$stage/hardware-summary-rows.js" <<'PVE_HW_ROWS_JS'
+        // BEGIN local hardware summary: cached data, optional sensors.
+        {
+            itemId: 'hardware-cpu-temperature',
+            colspan: 2,
+            printBar: false,
+            title: gettext('CPU 溫度'),
+            textField: 'hardware_info',
+            value: {},
+            renderer: function(data) {
+                const entries = Array.isArray(data?.cpu_temperatures) ? data.cpu_temperatures : [];
+                return entries.filter(item => Number.isFinite(item?.celsius)).map(item =>
+                    Ext.String.htmlEncode(String(item.label)) + ': ' + item.celsius.toFixed(1) + ' °C'
+                ).join(' | ') || '未提供';
+            },
+        },
+        {
+            itemId: 'hardware-cpu-frequency',
+            colspan: 2,
+            printBar: false,
+            title: gettext('CPU 頻率'),
+            textField: 'hardware_info',
+            value: {},
+            renderer: function(data) {
+                const entries = Array.isArray(data?.frequencies_mhz) ? data.frequencies_mhz : [];
+                const values = entries.filter(item => Number.isFinite(item?.mhz)).map(item =>
+                    'CPU ' + item.cpu + ': ' + Math.round(item.mhz) + ' MHz'
+                );
+                if (Number.isFinite(data?.min_mhz) && Number.isFinite(data?.max_mhz)) {
+                    values.push('範圍: ' + Math.round(data.min_mhz) + '–' + Math.round(data.max_mhz) + ' MHz');
+                }
+                return values.join(' | ') || '未提供';
+            },
+        },
+        {
+            itemId: 'hardware-cpu-power',
+            colspan: 2,
+            printBar: false,
+            title: gettext('CPU 封裝功耗'),
+            textField: 'hardware_info',
+            value: {},
+            renderer: function(data) {
+                const watts = Number.isFinite(data?.package_watts) ? data.package_watts.toFixed(2) + ' W' : '未提供';
+                const mode = data?.governor ? Ext.String.htmlEncode(String(data.governor)) : '未提供';
+                return watts + ' | 電源模式: ' + mode;
+            },
+        },
+        {
+            itemId: 'hardware-board-fans',
+            colspan: 2,
+            printBar: false,
+            title: gettext('主機板／風扇'),
+            textField: 'hardware_info',
+            value: {},
+            renderer: function(data) {
+                const temperatures = Array.isArray(data?.board_temperatures) ? data.board_temperatures : [];
+                const fans = Array.isArray(data?.fans) ? data.fans : [];
+                const board = temperatures.filter(item => Number.isFinite(item?.celsius)).map(item =>
+                    Ext.String.htmlEncode(String(item.label)) + ': ' + item.celsius.toFixed(1) + ' °C'
+                ).join(' | ') || '未提供';
+                const rpm = fans.filter(item => Number.isFinite(item?.rpm)).map(item =>
+                    Ext.String.htmlEncode(String(item.label)) + ': ' + Math.round(item.rpm) + ' RPM'
+                ).join(' | ') || '未提供';
+                return '主機板: ' + board + ' | 風扇: ' + rpm;
+            },
+        },
+        {
+            itemId: 'hardware-disks',
+            colspan: 2,
+            printBar: false,
+            title: gettext('SSD／硬碟'),
+            textField: 'hardware_info',
+            value: {},
+            renderer: function(data) {
+                const disks = Array.isArray(data?.disks) ? data.disks : [];
+                return disks.map(disk => {
+                    if (!disk || typeof disk !== 'object') { return ''; }
+                    const parts = [Ext.String.htmlEncode(String(disk.device || '磁碟')),
+                        Ext.String.htmlEncode(String(disk.model || ''))];
+                    if (Number.isFinite(disk.bytes)) { parts.push((disk.bytes / 1000000000).toFixed(1) + ' GB'); }
+                    parts.push('溫度: ' + (Number.isFinite(disk.celsius) ? disk.celsius + ' °C' : '未提供'));
+                    if (Number.isFinite(disk.hours)) { parts.push('通電: ' + disk.hours + ' 小時'); }
+                    return parts.join(' | ');
+                }).filter(Boolean).join('<br>') || '未提供';
+            },
+        },
+        // END local hardware summary.
+PVE_HW_ROWS_JS
+    python3 - "$stage" <<'PVE_HW_PATCH_PY'
+from pathlib import Path
+import re
+import sys
+
+stage = Path(sys.argv[1])
+base = stage / 'package'
+source = (base / 'usr/share/perl5/PVE/API2/Nodes.pm').read_text()
+anchor = '        $res->{pveversion} = PVE::pvecfg::package() . "/" . PVE::pvecfg::version_text();\n'
+assert source.count(anchor) == 1, '找不到唯一的節點狀態插入位置'
+patch = '''
+        # BEGIN local hardware summary: read a bounded cache, never run hardware tools here.
+        $res->{hardware_info} = {};
+        eval {
+            my $hardware = decode_json(file_get_contents('/run/pve-hardware-status.json', 65536));
+            if (ref($hardware) eq 'HASH' && ($hardware->{updated_at} // 0) >= time() - 60) {
+                $res->{hardware_info} = $hardware;
+            }
+        };
+        # END local hardware summary.
+'''
+source = source.replace(anchor, anchor + patch)
+schema_anchor = '            pveversion => {\n'
+assert source.count(schema_anchor) == 1, '找不到唯一的節點狀態 schema'
+source = source.replace(schema_anchor, '''            hardware_info => {
+                type => 'object',
+                optional => 1,
+                additionalProperties => 1,
+                description => 'Cached optional hardware readings for the local node summary.',
+            },
+''' + schema_anchor)
+(stage / 'Nodes.pm.patched').write_text(source)
+
+source = (base / 'usr/share/pve-manager/js/pvemanagerlib.js').read_text()
+start = source.index("Ext.define('PVE.node.StatusView', {")
+end = source.index("Ext.define('PVE.node.SubscriptionKeyEdit', {", start)
+section = source[start:end]
+height = re.search(r'(?m)^    height: (\d+),$', section)
+assert height, '找不到概覽高度設定'
+section = section[:height.start()] + '    height: ' + str(int(height[1]) + 160) + ',' + section[height.end():]
+anchor = "            textField: 'pveversion',\n            value: '',\n        },\n"
+assert section.count(anchor) == 1, '找不到唯一的概覽插入位置'
+section = section.replace(anchor, anchor + (stage / 'hardware-summary-rows.js').read_text())
+(stage / 'pvemanagerlib.js.patched').write_text(source[:start] + section + source[end:])
+PVE_HW_PATCH_PY
+    python3 -m py_compile "$stage/pve-hardware-status.py"
+    perl -c "$stage/Nodes.pm.patched"
+    install -d -m 700 "$backup"
+    for name in Nodes.pm pvemanagerlib.js; do
+        case "$name" in
+            Nodes.pm) source="$stage/package/usr/share/perl5/PVE/API2/Nodes.pm" ;;
+            pvemanagerlib.js) source="$stage/package/usr/share/pve-manager/js/pvemanagerlib.js" ;;
+        esac
+        if [ -e "$backup/$name.original" ]; then
+            cmp -s "$source" "$backup/$name.original" || { echo "原始備份校驗失敗。" >&2; exit 1; }
+        else
+            cp -a "$source" "$backup/$name.original"
+        fi
+    done
+    install -d -m 755 /usr/local/libexec
+    pve_hw_atomic_install "$stage/pve-hardware-status.py" /usr/local/libexec/pve-hardware-status.py 755
+    install -m 644 "$stage/pve-hardware-status.service" /etc/systemd/system/pve-hardware-status.service
+    install -m 644 "$stage/pve-hardware-status.timer" /etc/systemd/system/pve-hardware-status.timer
+    # 清理舊選項 4 增加的 setuid/setgid；採集服務本來就以 root 執行。
+    for source in /usr/sbin/turbostat /usr/sbin/nvme /usr/sbin/smartctl /usr/sbin/hddtemp /usr/sbin/linux-cpupower; do
+        [ ! -f "$source" ] || chmod a-s "$source"
+    done
+    systemctl daemon-reload
+    systemd-analyze verify /etc/systemd/system/pve-hardware-status.service /etc/systemd/system/pve-hardware-status.timer
+    systemctl start pve-hardware-status.service
+    python3 - <<'PVE_HW_CACHE_PY'
+import json, time
+from pathlib import Path
+data=json.loads(Path('/run/pve-hardware-status.json').read_text())
+assert isinstance(data, dict) and data.get('updated_at', 0) >= time.time()-60
+PVE_HW_CACHE_PY
+    # 若使用者同步修改介面檔案，停止部署，避免覆蓋。
+    cmp -s /usr/share/perl5/PVE/API2/Nodes.pm "$stage/Nodes.pm.before"
+    cmp -s /usr/share/pve-manager/js/pvemanagerlib.js "$stage/pvemanagerlib.js.before"
+    deployment_started=1
+    pve_hw_atomic_install "$stage/Nodes.pm.patched" /usr/share/perl5/PVE/API2/Nodes.pm 644
+    pve_hw_atomic_install "$stage/pvemanagerlib.js.patched" /usr/share/pve-manager/js/pvemanagerlib.js 644
+    pvesh get "/nodes/$(hostname -s)/status" --output-format json > "$stage/status.json"
+    python3 - "$stage/status.json" <<'PVE_HW_API_PY'
+import json, sys
+from pathlib import Path
+data=json.loads(Path(sys.argv[1]).read_text())
+assert isinstance(data.get('hardware_info'), dict), '硬體資訊 API 驗證失敗'
+PVE_HW_API_PY
+    systemctl enable --now pve-hardware-status.timer
+    pve_hw_reload_later
+    deployment_started=0
+    echo "CPU 溫度、核心頻率、CPU 封裝功耗及磁碟資訊已安裝。"
+    echo "缺少的主機板／風扇感測器會顯示『未提供』，不會中斷概覽。"
+    echo "約 3 秒後重新載入管理服務；若命令列短暫斷線，安裝已完成。"
+    echo "請用 Ctrl+Shift+R（Mac：Command+Shift+R）重新載入管理頁面。"
+    echo "目前版本原始檔備份：$backup"
+); }
+
+cpu_del(){ (
+    set -euo pipefail
+    pve_hw_require
+    local stage version deployment_started=0
+    stage=$(mktemp -d /var/tmp/pve-hardware-remove.XXXXXX)
+    version=$(dpkg-query -W -f='${Version}' pve-manager)
+    pve_hw_del_cleanup(){
+        local result=$?
+        trap - EXIT HUP INT TERM
+        set +e
+        if [ "$result" -ne 0 ] && [ "$deployment_started" -eq 1 ]; then
+            pve_hw_atomic_install "$stage/Nodes.pm.before" /usr/share/perl5/PVE/API2/Nodes.pm 644
+            pve_hw_atomic_install "$stage/pvemanagerlib.js.before" /usr/share/pve-manager/js/pvemanagerlib.js 644
+            pve_hw_reload_later
+            echo "還原未完成，已回復本次操作前的介面檔案。" >&2
+        fi
+        rm -rf -- "$stage"
+        exit "$result"
+    }
+    trap pve_hw_del_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # 即使升級後舊備份不相容，也只還原目前已安裝版本的官方檔案。
+    pve_hw_pristine "$stage" "$version"
+    pve_hw_check_existing "$stage"
+    cp -a /usr/share/perl5/PVE/API2/Nodes.pm "$stage/Nodes.pm.before"
+    cp -a /usr/share/pve-manager/js/pvemanagerlib.js "$stage/pvemanagerlib.js.before"
+    perl -c "$stage/package/usr/share/perl5/PVE/API2/Nodes.pm"
+    deployment_started=1
+    pve_hw_atomic_install "$stage/package/usr/share/perl5/PVE/API2/Nodes.pm" /usr/share/perl5/PVE/API2/Nodes.pm 644
+    pve_hw_atomic_install "$stage/package/usr/share/pve-manager/js/pvemanagerlib.js" /usr/share/pve-manager/js/pvemanagerlib.js 644
+    if [ -f /etc/systemd/system/pve-hardware-status.timer ]; then
+        systemctl disable --now pve-hardware-status.timer
+    fi
+    if [ -f /etc/systemd/system/pve-hardware-status.service ]; then
+        systemctl stop pve-hardware-status.service
+    fi
+    rm -f /etc/systemd/system/pve-hardware-status.timer /etc/systemd/system/pve-hardware-status.service \
+        /usr/local/libexec/pve-hardware-status.py /run/pve-hardware-status.json
+    systemctl daemon-reload
+    pve_hw_reload_later
+    deployment_started=0
+    echo "已還原目前 PVE 版本的原始介面，並停用、移除硬體採集服務。"
+    echo "請用 Ctrl+Shift+R（Mac：Command+Shift+R）重新載入管理頁面。"
+); }
 
 #--------------CPU、主機板、硬碟溫度顯示----------------
-
 
 
 # 主菜單
